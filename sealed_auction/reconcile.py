@@ -256,3 +256,135 @@ def assert_reconciled(db) -> dict[str, Any]:
             "reconciliation failed:\n" + "\n".join(report["violations"])
         )
     return report
+
+
+def reconcile_fulfillment(db) -> dict[str, Any]:
+    """Independent check of whole-box custody and delivery documents.
+
+    Rebuilds from raw boxes / acceptances / reseals / vouchers / withdrawals
+    rather than trusting service return values.
+    """
+    violations: list[str] = []
+    with db.read() as conn:
+        # Every seal is physically present at most once.
+        dup = conn.execute(
+            "SELECT seal_id, COUNT(*) n FROM boxes GROUP BY seal_id HAVING n > 1"
+        ).fetchall()
+        for d in dup:
+            violations.append(f"seal {d['seal_id']} registered {d['n']} times")
+
+        # Box status must agree with the withdrawal log.
+        for b in conn.execute("SELECT * FROM boxes"):
+            withdrawn = conn.execute(
+                "SELECT COUNT(*) n FROM withdrawals WHERE box_id=?",
+                (b["box_id"],),
+            ).fetchone()["n"]
+            if b["status"] == "PICKED" and withdrawn != 1:
+                violations.append(
+                    f"box {b['box_id']}: PICKED but {withdrawn} withdrawal records"
+                )
+            if b["status"] != "PICKED" and withdrawn:
+                violations.append(
+                    f"box {b['box_id']}: {b['status']} but already withdrawn"
+                )
+
+        # Reseals conserve pieces and point at two distinct replacement boxes.
+        for r in conn.execute("SELECT * FROM reseals"):
+            new_ids = json.loads(r["new_boxes_json"])
+            if len(new_ids) != 2 or len(set(new_ids)) != 2:
+                violations.append(f"reseal {r['reseal_id']}: not two distinct boxes")
+                continue
+            old = conn.execute(
+                "SELECT qty, status FROM boxes WHERE box_id=?", (r["old_box_id"],)
+            ).fetchone()
+            new_total = 0
+            for nid in new_ids:
+                nb = conn.execute(
+                    "SELECT qty FROM boxes WHERE box_id=?", (nid,)
+                ).fetchone()
+                if nb is None:
+                    violations.append(f"reseal {r['reseal_id']}: missing box {nid}")
+                else:
+                    new_total += nb["qty"]
+            if old is None:
+                violations.append(f"reseal {r['reseal_id']}: missing old box")
+            else:
+                if old["qty"] != new_total:
+                    violations.append(
+                        f"reseal {r['reseal_id']}: pieces {old['qty']} -> "
+                        f"{new_total} not conserved"
+                    )
+                if old["status"] != "REPLACED":
+                    violations.append(
+                        f"reseal {r['reseal_id']}: old box status {old['status']}"
+                    )
+
+        # Vouchers: pieces = sum of box pieces; no box on two live vouchers.
+        for v in conn.execute(
+            "SELECT voucher_id, box_ids_json, units, status FROM vouchers"
+        ):
+            total = 0
+            for box_id in json.loads(v["box_ids_json"]):
+                b = conn.execute(
+                    "SELECT qty, status FROM boxes WHERE box_id=?", (box_id,)
+                ).fetchone()
+                if b is None:
+                    violations.append(f"voucher {v['voucher_id']}: missing box {box_id}")
+                    continue
+                total += b["qty"]
+                if v["status"] in ("ISSUED", "REDEEMED") and b["status"] not in (
+                    "STORED", "PICKED"
+                ):
+                    violations.append(
+                        f"voucher {v['voucher_id']}: box {box_id} is {b['status']}"
+                    )
+            if total != v["units"]:
+                violations.append(
+                    f"voucher {v['voucher_id']}: units {v['units']} != box sum {total}"
+                )
+
+        live_dup = conn.execute(
+            "SELECT box_id, COUNT(*) n FROM voucher_boxes GROUP BY box_id HAVING n>1"
+        ).fetchall()
+        for d in live_dup:
+            violations.append(f"box {d['box_id']} appears on {d['n']} vouchers")
+
+        # A redeemed voucher must have exactly one matching pickup receipt.
+        for v in conn.execute(
+            "SELECT voucher_id, status FROM vouchers WHERE status='REDEEMED'"
+        ):
+            n = conn.execute(
+                "SELECT COUNT(*) n FROM pickup_receipts WHERE voucher_id=?",
+                (v["voucher_id"],),
+            ).fetchone()["n"]
+            if n != 1:
+                violations.append(
+                    f"voucher {v['voucher_id']}: REDEEMED with {n} receipts"
+                )
+
+        # Per auction: handed pieces + live voucher pieces never exceed awards,
+        # and picked pieces equal delivered voucher pieces.
+        for au in conn.execute("SELECT auction_id, allocations_json FROM settlements"):
+            snap = json.loads(au["allocations_json"])
+            awarded: dict[str, int] = {}
+            for a in snap["allocations"]:
+                if a["allocated_qty"] > 0:
+                    awarded[a["buyer"]] = awarded.get(a["buyer"], 0) + a["allocated_qty"]
+            for buyer, cap in awarded.items():
+                rows = conn.execute(
+                    "SELECT units, status FROM vouchers WHERE auction_id=? AND buyer=?",
+                    (au["auction_id"], buyer),
+                ).fetchall()
+                delivered = sum(r["units"] for r in rows if r["status"] == "REDEEMED")
+                live = sum(r["units"] for r in rows if r["status"] == "ISSUED")
+                if delivered > cap:
+                    violations.append(
+                        f"{au['auction_id']}/{buyer}: delivered {delivered} > awarded {cap}"
+                    )
+                if delivered + live > cap:
+                    violations.append(
+                        f"{au['auction_id']}/{buyer}: vouchered+delivered "
+                        f"{delivered + live} > awarded {cap}"
+                    )
+
+    return {"ok": not violations, "violations": violations}

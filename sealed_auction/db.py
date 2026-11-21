@@ -107,6 +107,139 @@ CREATE TABLE IF NOT EXISTS settlements (
     created_at             TEXT NOT NULL,
     cleared_at             TEXT
 );
+
+-- =====================================================================
+-- Sealed whole-box warehouse, delivery right and pickup vouchers.
+-- The auction allocates homogeneous *units*; physical fulfilment is by
+-- whole sealed sample boxes received from suppliers.  Boxes are never
+-- split: a delivery right of N units can only be met by whole boxes
+-- whose sizes sum to exactly N.
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS intake_batches (
+    batch_id         TEXT PRIMARY KEY,
+    max_boxes        INTEGER NOT NULL CHECK (max_boxes BETWEEN 1 AND 24),
+    received_at      TEXT NOT NULL,
+    received_boxes   INTEGER NOT NULL DEFAULT 0
+);
+
+-- A registered box.  The seal is the stable identity; content and custody
+-- condition are declared at delivery.
+CREATE TABLE IF NOT EXISTS boxes (
+    box_id           TEXT PRIMARY KEY,
+    seal_id          TEXT NOT NULL,
+    qty              INTEGER NOT NULL CHECK (qty > 0),
+    batch_id         TEXT NOT NULL REFERENCES intake_batches(batch_id),
+    condition        TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'RECEIVED'
+                     CHECK (status IN ('RECEIVED','STORED','PICKED','DAMAGED','REPLACED')),
+    superseded_by    TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+-- One seal may be physically present only once; same seal + same content
+-- re-arriving is a duplicate, a different content is a correction conflict.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_box_seal ON boxes(seal_id);
+CREATE INDEX IF NOT EXISTS idx_box_batch ON boxes(batch_id);
+
+CREATE TABLE IF NOT EXISTS box_events (
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    box_id           TEXT NOT NULL,
+    seal_id          TEXT NOT NULL,
+    request_id       TEXT NOT NULL,
+    action           TEXT NOT NULL CHECK (action IN (
+                        'RECEIVE','RESTATE','STORE','ODD','DAMAGE',
+                        'PICK','RESEAL_OUT','RESEAL_IN')),
+    detail_json      TEXT NOT NULL,
+    at               TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_box_events_box ON box_events(box_id);
+
+-- A buyer's own licensing terms: which custody conditions it will accept and
+-- the date by which it must collect.  Both gate every voucher for that buyer.
+CREATE TABLE IF NOT EXISTS buyer_terms (
+    buyer             TEXT PRIMARY KEY,
+    conditions_json   TEXT NOT NULL,
+    pickup_deadline   TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+
+-- A buyer declaring a specific inspected box acceptable.  Several buyers may
+-- accept the same box; the allocator picks at most one of them.  Accepting a
+-- box is what makes it usable for that buyer ("only seal X is acceptable to
+-- buyer Y" is represented by only Y having an acceptance for X).
+CREATE TABLE IF NOT EXISTS acceptances (
+    acceptance_id    TEXT PRIMARY KEY,
+    batch_id         TEXT NOT NULL REFERENCES intake_batches(batch_id),
+    buyer            TEXT NOT NULL,
+    box_id           TEXT NOT NULL REFERENCES boxes(box_id),
+    created_at       TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_accept_buyer_box
+    ON acceptances(batch_id, buyer, box_id);
+CREATE INDEX IF NOT EXISTS idx_accept_box ON acceptances(box_id);
+CREATE INDEX IF NOT EXISTS idx_accept_buyer ON acceptances(buyer);
+
+-- Official re-seal, split of one accepted box into two accepted boxes with
+-- the same total pieces.  Both halves must be already received.
+CREATE TABLE IF NOT EXISTS reseals (
+    reseal_id        TEXT PRIMARY KEY,
+    old_box_id       TEXT NOT NULL REFERENCES boxes(box_id),
+    new_boxes_json   TEXT NOT NULL,
+    total_qty        INTEGER NOT NULL CHECK (total_qty > 0),
+    status           TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+);
+
+-- Physical withdrawal window (a pickup clerk at the dock).  This is NOT the
+-- buyer's fulfilment: it records that pieces physically left the warehouse.
+-- `frozen_voucher_id` is the voucher that reserved those pieces, if any.
+CREATE TABLE IF NOT EXISTS withdrawals (
+    withdrawal_id    TEXT PRIMARY KEY,
+    box_id           TEXT NOT NULL REFERENCES boxes(box_id),
+    window_id        TEXT NOT NULL,
+    frozen_voucher_id TEXT,
+    request_id       TEXT NOT NULL UNIQUE,
+    at               TEXT NOT NULL
+);
+-- A box physically leaves the dock at most once.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_withdraw_box ON withdrawals(box_id);
+
+-- A pickup voucher (提货单) is all-or-nothing: it is only issued when the
+-- frozen remaining delivery right of one buyer can be met by whole accepted
+-- boxes summing to exactly that quantity.
+CREATE TABLE IF NOT EXISTS vouchers (
+    voucher_id       TEXT PRIMARY KEY,
+    batch_id         TEXT NOT NULL REFERENCES intake_batches(batch_id),
+    auction_id       TEXT NOT NULL,
+    buyer            TEXT NOT NULL,
+    box_ids_json     TEXT NOT NULL,
+    units            INTEGER NOT NULL CHECK (units > 0),
+    status           TEXT NOT NULL CHECK (status IN ('ISSUED','REDEEMED','VOID')),
+    issued_at        TEXT NOT NULL,
+    redeemed_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_voucher_buyer ON vouchers(buyer);
+CREATE INDEX IF NOT EXISTS idx_voucher_batch ON vouchers(batch_id);
+
+CREATE TABLE IF NOT EXISTS voucher_boxes (
+    voucher_id       TEXT NOT NULL REFERENCES vouchers(voucher_id),
+    box_id           TEXT NOT NULL REFERENCES boxes(box_id),
+    PRIMARY KEY (voucher_id, box_id)
+);
+-- A box may appear on at most one live voucher, ever.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_voucher_box ON voucher_boxes(box_id);
+
+-- Pickup receipts are idempotent per request id; each records exactly which
+-- boxes were handed over, in which window, against which frozen voucher.
+CREATE TABLE IF NOT EXISTS pickup_receipts (
+    request_id       TEXT PRIMARY KEY,
+    voucher_id       TEXT NOT NULL REFERENCES vouchers(voucher_id),
+    buyer            TEXT NOT NULL,
+    window_id        TEXT NOT NULL,
+    box_ids_json     TEXT NOT NULL,
+    at               TEXT NOT NULL
+);
 """
 
 

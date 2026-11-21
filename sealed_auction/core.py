@@ -44,6 +44,18 @@ class DataIntegrityError(DomainError):
     pass
 
 
+class ContentConflict(DomainError):
+    """Same seal re-arrived with different declared content; correct it."""
+
+
+class InventoryMismatch(DomainError):
+    """Physical stock no longer matches a voucher or receipt."""
+
+
+class NotEligible(DomainError):
+    """A buyer, box, or authorisation does not satisfy the pickup rules."""
+
+
 class ResponseLost(Exception):
     """Transport-level failure after the database transaction committed.
 

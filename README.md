@@ -45,16 +45,50 @@ sealed_auction/
   auction.py     拍卖服务：投标/修订/撤销/冻结结标/结算/复读/解释
   clearing.py    跨模块编排、对账单
   reconcile.py   仅从原始事件独立重算账户与获配
+  fulfillment.py 整箱仓库验收、换封、取货凭单与现场交割
 examples/run_demo.py   从入金到结标清算的复跑入口
-tests/test_scenarios.py 16 个场景测试
+examples/run_delivery.py 3/2/1 整箱发单、换封、取货回执演示
+tests/test_scenarios.py 16 个拍卖/保证金场景测试
+tests/test_fulfillment.py 20 个整箱交割场景测试
 ```
+
+## 整箱交割（sealed_auction.fulfillment）
+
+旧拍卖按同质**单位**结标，实际发放的是供应商预先封好的**整箱**样品。整箱永不拆开：某买家欠 `N` 单位，只能由件数之和**恰好等于 N** 的整箱组合交付。
+
+| 关注点 | 实现 |
+| --- | --- |
+| 验收 | `receive_box`：稳定 `seal_id` + 正整数件数 + 到货批次 + 保管条件；同封签同内容重到只计一次（`duplicate=True`），异内容抛 `ContentConflict`，须 `restate_box` 显式更正 |
+| 批次上限 | 每批 ≤ 24 箱、≤ 10 张凭单 |
+| 受理 | `set_buyer_terms`（买家自有的可受理条件 + 取货截止日）+ `accept_box`（逐箱接受）。只有已验（`STORED`）且未取走的整箱可用；仅某买家接受的箱即成为其专属选项 |
+| 报损/重验 | `damage_box` 将箱置为 `DAMAGED`；受损箱不可交付。`store_box`/`restate_box` 重验 |
+| 换封 | `reseal`：旧箱 → 两新箱，**总件数守恒**，须指明原箱、新箱与授权买家（授权者自动接受新箱）。已提走/已上凭单的箱不可换 |
+| 权利口径 | 每买家冻结所得 `awarded`；已取 + 在途凭单 + 剩余。买家仅受**全额一张**凭单，不允许半张先销权 |
+| 联合排箱 | `issue_vouchers`：先最大化兑现总件数，再最大化兑现买家数，同分确定性取一个方案；箱不共享 |
+| 逐单发单 | `issue_voucher_for_buyer`：无法凑齐全额时整单拒绝（`NotEligible`），绝不出半张 |
+| 提货 | `pickup`：按冻结凭单逐箱核对**实际库存**；任一箱已报损/另一窗口已提走则整单中止（`InventoryMismatch`）。同 `request_id` 重放回执；已核销凭单的新请求被拒，同一权利/同箱不会交付两次 |
+| 未知回执 | `get_pickup(request_id)` 按原单核实；`inspect_voucher` 对活库存复核凭单是否破损 |
+| 退单 | `void_voucher`：未取走的凭单作废，箱回到可用库存；权利不变，可再发单 |
+| 扣款隔离 | 交割只读冻结成交价，不重算、不改价；某买家取不到箱不会偷偷重定他人成交价 |
+| 独立对账 | `reconcile_fulfillment` 从箱/接受/换封/凭单/出库原始记录独立重算 |
+
+### 3 / 2 / 1 场景（`python3 -m examples.run_delivery`）
+
+甲、乙、丙各获 3、2、1 件，可用箱为 3、2、1 件各一，3 件箱仅乙能收：
+
+1. 乙只欠 2，含 3 件的箱**不能切开充数**，故乙不可用 3 件箱；
+2. 甲拿 2+1 只能兑现一人；联合最优为**乙 2、丙 1**，兑现 3 件 / 2 人，甲仍欠；
+3. 仓库将 3 件箱换封为 1 + 2 且甲授权后，重开排箱三人领齐 6 件（甲 1+2、乙 2、丙 1）；
+4. 各凭单在窗口逐一交割并回执；重复/未知回执按原单核实，不重复交付。
 
 ## 复跑
 
 ```bash
 python3 -m unittest tests.test_scenarios -v
+python3 -m unittest tests.test_fulfillment -v
 python3 -m examples.run_demo                       # 临时库
 python3 -m examples.run_demo --db demo.sqlite3     # 持久库；多次运行自动命名空间隔离
+python3 -m examples.run_delivery                   # 3/2/1 整箱交割演示
 ```
 
 演示逐步打印：
